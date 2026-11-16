@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """portscan [OPTIONS] IP_ADDRESS [{tcp|udp}[/[PORT|PORT-PORT],...]]...
 
-Часть 1: разбор аргументов, TCP SYN-скан (ручные пакеты, epoll), -v, вывод.
+TCP SYN (ручные пакеты) + UDP (+ICMP) на epoll, -v, -g (HTTP/DNS/ECHO).
 """
 import argparse
+import errno
 import ipaddress
 import random
 import re
@@ -180,13 +181,225 @@ def scan_tcp(ip, ports, timeout, window):
         raw.close()
 
 
+def dns_query(txid):
+    q = struct.pack('!HHHHHH', txid, 0x0100, 1, 0, 0, 0)  # RD=1, один вопрос
+    return q + b'\x07example\x03com\x00' + struct.pack('!HH', 1, 1)  # A, IN
+
+
+class Probes:
+    def __init__(self, ip):
+        self.dns_id = random.randint(0, 0xFFFF)
+        self.dns = dns_query(self.dns_id)
+        self.dns_tcp = struct.pack('!H', len(self.dns)) + self.dns  # TCP: префикс длины
+        self.echo = b'portscan-%08x\n' % random.getrandbits(32)
+        self.http = (f'GET / HTTP/1.1\r\nHost: {ip}\r\n'
+                     'Connection: close\r\n\r\n').encode()
+
+
+def classify(buf, probe, dns_id, tcp):
+    """По форме ответа определяет протокол: HTTP / DNS / ECHO / None."""
+    if buf.startswith(b'HTTP/'):
+        return 'HTTP'
+    msg = buf[2:] if tcp else buf  # в TCP-DNS первые 2 байта = длина
+    if len(msg) >= 12:
+        rid, flags = struct.unpack('!HH', msg[:4])
+        if rid == dns_id and flags & 0x8000 and (flags >> 11) & 0xF == 0:  # QR=1, opcode=0
+            return 'DNS'
+    if len(buf) >= len(probe) and buf[:len(probe)] == probe:
+        return 'ECHO'  # вернули ровно то, что мы отправили
+    return None
+
+
+def drain(sock, handler):
+    while True:
+        try:
+            data, addr = sock.recvfrom(65535)
+        except BlockingIOError:
+            return
+        except ConnectionRefusedError:
+            continue
+        handler(data, addr)
+
+
+def scan_udp(ip, ports, timeout, window):
+    """Возвращает {порт: протокол|None} для портов, с которых пришёл UDP-ответ."""
+    usock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    icmp = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    ep = select.epoll()
+    try:
+        usock.bind(('0.0.0.0', 0))
+        local_port = usock.getsockname()[1]
+        usock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 22)
+        for s in (usock, icmp):
+            s.setblocking(False)
+            ep.register(s.fileno(), select.EPOLLIN)
+
+        pr = Probes(ip)
+        is_local = ip.startswith('127.') or local_ip_for(ip) == ip
+        # при скане своего хоста наш же сокет "ответил" бы сам себе
+        pending = deque(p for p in sorted(ports) if not (is_local and p == local_port))
+        in_flight = {}
+        deadlines = deque()
+        found = {}
+
+        def on_udp(data, addr):
+            port = addr[1]
+            if addr[0] != ip or (port not in in_flight and port not in found):
+                return
+            in_flight.pop(port, None)
+            g = classify(data, pr.dns, pr.dns_id, False) or classify(data, pr.echo, pr.dns_id, False)
+            if found.get(port) is None:  # более точный ответ может прийти позже
+                found[port] = g
+
+        def on_icmp(data, addr):
+            if addr[0] != ip or len(data) < 20:
+                return
+            ihl = (data[0] & 15) * 4
+            if len(data) < ihl + 8 + 20 or data[ihl] != 3:  # type 3 = unreachable
+                return  # (code 3 = порт закрыт)
+            inner = data[ihl + 8:]  # копия нашего IP+UDP заголовков
+            iihl = (inner[0] & 15) * 4
+            if inner[9] != 17 or socket.inet_ntoa(inner[16:20]) != ip or len(inner) < iihl + 4:
+                return
+            sp, dp = struct.unpack('!HH', inner[iihl:iihl + 4])
+            if sp == local_port:
+                in_flight.pop(dp, None)
+
+        while pending or in_flight:
+            while pending and len(in_flight) < window:
+                port = pending.popleft()
+                try:
+                    usock.sendto(pr.dns, (ip, port))
+                    usock.sendto(pr.echo, (ip, port))
+                except BlockingIOError:
+                    pending.appendleft(port)
+                    break
+                except ConnectionRefusedError:
+                    continue
+                now = time.monotonic()
+                in_flight[port] = now
+                deadlines.append((now + timeout, port))
+
+            while deadlines and deadlines[0][1] not in in_flight:
+                deadlines.popleft()
+            wait = max(0.0, deadlines[0][0] - time.monotonic()) if deadlines else 0.0
+
+            for fd, _ in ep.poll(wait):
+                if fd == usock.fileno():
+                    drain(usock, on_udp)
+                else:
+                    drain(icmp, on_icmp)
+
+            now = time.monotonic()
+            while deadlines and deadlines[0][0] <= now:
+                in_flight.pop(deadlines.popleft()[1], None)
+        return found
+    finally:
+        ep.close()
+        usock.close()
+        icmp.close()
+
+
+class Job:
+    __slots__ = ('port', 'probe', 'sock', 'state', 'buf', 'done')
+
+    def __init__(self, port, probe, sock):
+        self.port, self.probe, self.sock = port, probe, sock
+        self.state, self.buf, self.done = 0, b'', False  # 0=connect, 1=ждём ответ
+
+
+def guess_tcp(ip, ports, timeout, window):
+    """Для открытых TCP-портов: по отдельному соединению на каждую пробу."""
+    pr = Probes(ip)
+    pending = deque((p, pb) for p in sorted(ports) for pb in (pr.http, pr.dns_tcp, pr.echo))
+    jobs, deadlines, result = {}, deque(), {}
+    ep = select.epoll()
+
+    def finish(job):
+        if job.done:
+            return
+        job.done = True
+        fd = job.sock.fileno()
+        jobs.pop(fd, None)
+        try:
+            ep.unregister(fd)
+        except OSError:
+            pass
+        job.sock.close()
+        g = classify(job.buf, job.probe, pr.dns_id, True)
+        if g and result.get(job.port) is None:
+            result[job.port] = g
+
+    def start(port, probe):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setblocking(False)
+        if s.connect_ex((ip, port)) not in (0, errno.EINPROGRESS):
+            s.close()
+            return
+        job = Job(port, probe, s)
+        jobs[s.fileno()] = job
+        ep.register(s.fileno(), select.EPOLLOUT)
+        deadlines.append((time.monotonic() + timeout, job))
+
+    def on_event(job):
+        if job.state == 0:  # connect завершился (успешно или нет)
+            if job.sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR):
+                return finish(job)
+            try:
+                job.sock.send(job.probe)
+            except OSError:
+                return finish(job)
+            job.state = 1
+            ep.modify(job.sock.fileno(), select.EPOLLIN)
+            return None
+        try:
+            data = job.sock.recv(65535)
+        except BlockingIOError:
+            return None
+        except OSError:
+            return finish(job)
+        if not data:  # сервер закрыл соединение
+            return finish(job)
+        job.buf += data
+        if classify(job.buf, job.probe, pr.dns_id, True):
+            finish(job)
+        return None
+
+    try:
+        while pending or jobs:
+            while pending and len(jobs) < window:
+                start(*pending.popleft())
+            while deadlines and deadlines[0][1].done:
+                deadlines.popleft()
+            wait = max(0.0, deadlines[0][0] - time.monotonic()) if deadlines else 0.0
+            for fd, _ in ep.poll(wait):
+                job = jobs.get(fd)
+                if job:
+                    on_event(job)
+            now = time.monotonic()
+            while deadlines and deadlines[0][0] <= now:
+                finish(deadlines.popleft()[1])
+        return result
+    finally:
+        for job in list(jobs.values()):
+            job.sock.close()
+        ep.close()
+
+
 def main():
     a = parse_args()
     results = []  # (proto, port, rtt_ms | None, guess | None)
     try:
         if a.ports['tcp']:
-            for port, rtt in scan_tcp(a.ip, a.ports['tcp'], a.timeout, a.num_threads).items():
-                results.append(('tcp', port, rtt, None))
+            opened = scan_tcp(a.ip, a.ports['tcp'], a.timeout, a.num_threads)
+            guesses = {}
+            if a.guess and opened:
+                guesses = guess_tcp(a.ip, opened, a.timeout, a.num_threads)
+            for port, rtt in opened.items():
+                results.append(('tcp', port, rtt, guesses.get(port)))
+        if a.ports['udp']:
+            for port, g in scan_udp(a.ip, a.ports['udp'], a.timeout, a.num_threads).items():
+                results.append(('udp', port, None, g))
     except PermissionError:
         die('нужны права root (raw-сокеты): запустите через sudo', 1)
     except KeyboardInterrupt:
