@@ -30,20 +30,20 @@ def parse_specs(specs):
         proto, slash, rest = spec.partition('/')
         proto = proto.lower()
         if proto not in ports:
-            die(f'неизвестный протокол в "{spec}"')
+            die(f'Неизвестный протокол в "{spec}"')
         if not slash:  # голое tcp / udp -> все порты
             ports[proto].update(range(1, 65536))
             continue
         if not rest:
-            die(f'пустой список портов в "{spec}"')
+            die(f'Пустой список портов в "{spec}"')
         for item in rest.split(','):
             m = re.fullmatch(r'(\d+)(?:-(\d+))?', item)
             if not m:
-                die(f'неверный порт или диапазон "{item}" в "{spec}"')
+                die(f'Неверный порт или диапазон "{item}" в "{spec}"')
             lo = int(m[1])
             hi = int(m[2]) if m[2] else lo
             if not 1 <= lo <= hi <= 65535:
-                die(f'порт вне диапазона 1-65535: "{item}"')
+                die(f'Порт вне диапазона 1-65535: "{item}"')
             ports[proto].update(range(lo, hi + 1))
     return ports
 
@@ -69,8 +69,8 @@ def parse_args():
         die('--timeout должен быть > 0')
     if a.num_threads < 1:
         die('-j должен быть >= 1')
-    if not a.specs:
-        die('не указаны порты, например: tcp/80 udp/53')
+    if not a.specs:  # ничего не указано -> все порты, tcp и udp
+        a.specs = ['tcp', 'udp']
     a.ports = parse_specs(a.specs)
     return a
 
@@ -401,11 +401,11 @@ def main():
             for port, g in scan_udp(a.ip, a.ports['udp'], a.timeout, a.num_threads).items():
                 results.append(('udp', port, None, g))
     except PermissionError:
-        die('нужны права root (raw-сокеты): запустите через sudo', 1)
+        die('Запустите через sudo для работы с raw-сокетами', 1)
     except KeyboardInterrupt:
         sys.exit(130)
     except OSError as e:
-        die(f'ошибка: {e}', 1)
+        die(f'Ошибка: {e}', 1)
 
     for proto, port, rtt, guess in sorted(results, key=lambda r: (r[0] != 'tcp', r[1])):
         line = f'{proto.upper()} {port}'
